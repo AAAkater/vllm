@@ -6,7 +6,11 @@ from vllm.platforms import current_platform
 
 from .quant_config import DeepseekV4FP8Config
 
-if current_platform.is_rocm():
+if current_platform.is_out_of_tree():
+    # Import common config/processor utilities without eagerly loading a
+    # CUDA backend. The hardware plugin owns its model registration.
+    pass
+elif current_platform.is_rocm():
     from .amd.dspark import DSparkDeepseekV4ForCausalLM
     from .amd.vl_model import DeepseekV41ForCausalLM
 else:

@@ -605,6 +605,19 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _record_execution_round_consumption(self, model_output):
+        rounds = getattr(model_output, "execution_rounds", None)
+        if not rounds:
+            return
+        consumed_ns = time.perf_counter_ns()
+        records = getattr(self, "_execution_round_records", None)
+        if records is None:
+            records = self._execution_round_records = []
+        if len(records) + len(rounds) > 65536:
+            raise RuntimeError("Execution round timing capacity exceeded")
+        records.extend({"request_id": req, "generation": generation, "target_count": count,
+                        "scheduler_consumed_ns": consumed_ns} for req, generation, count in rounds)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -633,6 +646,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._record_execution_round_consumption(model_output)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -735,6 +749,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._record_execution_round_consumption(model_output)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -772,8 +787,24 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
+    def _flush_execution_round_timing(self):
+        if getattr(self, "_execution_round_records", None):
+            import json
+            from pathlib import Path
+            directory = os.environ.get("DSV41_RUN_EVIDENCE")
+            if not directory:
+                raise RuntimeError("Execution round timing requires its evidence directory")
+            output = Path(directory) / "round-timing"
+            output.mkdir(exist_ok=True)
+            destination = output / f"engine-{os.getpid()}.json"
+            temporary = destination.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps({"clock": "perf_counter_ns", "records": self._execution_round_records}) + "\n")
+            temporary.replace(destination)
+
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        self._flush_execution_round_timing()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -791,6 +822,9 @@ class EngineCore:
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        # A profiler export failure must not erase completed, unprofiled
+        # scheduler consumption records. This runs at the API boundary only.
+        self._flush_execution_round_timing()
         self.model_executor.profile(is_start, profile_prefix)
 
     def reset_mm_cache(self):

@@ -9,6 +9,11 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.auxiliary_prefix_cache import (
+    AuxiliaryPrefixCache,
+    AuxiliaryPrefixDescriptor,
+    AuxiliaryPrefixOperations,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -132,6 +137,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        auxiliary_prefix_cache: AuxiliaryPrefixCache | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -141,6 +147,8 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.auxiliary_prefix_cache = auxiliary_prefix_cache
+        self.auxiliary_prefix_hits: dict[str, AuxiliaryPrefixDescriptor] = {}
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -246,6 +254,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        self.auxiliary_prefix_hits.pop(request.request_id, None)
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
@@ -261,6 +270,22 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        if self.auxiliary_prefix_cache is not None:
+            descriptor = self.auxiliary_prefix_cache.find(
+                request.block_hashes,
+                num_new_computed_tokens,
+                tuple(
+                    tuple(block.block_id for block in group)
+                    for group in computed_blocks
+                ),
+            )
+            if descriptor is None:
+                return self.empty_kv_cache_blocks, 0, 0
+            num_new_computed_tokens, num_uncached = descriptor.num_tokens, 0
+            count = descriptor.num_tokens // self.auxiliary_prefix_cache.block_size
+            computed_blocks = tuple(group[:count] for group in computed_blocks)
+            self.auxiliary_prefix_hits[request.request_id] = descriptor
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -622,12 +647,59 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if (
+            self.auxiliary_prefix_cache is not None
+            and not self.auxiliary_prefix_cache.can_reset
+        ):
+            return False
         if not self.block_pool.reset_prefix_cache():
             return False
+        if self.auxiliary_prefix_cache is not None:
+            self.auxiliary_prefix_cache.reset()
+            self.auxiliary_prefix_hits.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
         return True
+
+    def prepare_auxiliary_prefixes(
+        self,
+        new_request_ids: Sequence[str],
+        requests: dict[str, Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> AuxiliaryPrefixOperations | None:
+        cache = self.auxiliary_prefix_cache
+        if cache is None:
+            return None
+        operations = AuxiliaryPrefixOperations()
+        # Lease every admitted hit before reserving any replacement slot.
+        for request_id in new_request_ids:
+            if requests[request_id].num_computed_tokens == 0:
+                continue
+            descriptor = self.auxiliary_prefix_hits.get(request_id)
+            if descriptor is None:
+                raise RuntimeError("Computed prefix has no auxiliary state checkpoint")
+            cache.lease(request_id, descriptor)
+            operations.restores[request_id] = descriptor
+        self.auxiliary_prefix_hits.clear()
+        for request_id, count in num_scheduled_tokens.items():
+            request = requests[request_id]
+            start = request.num_computed_tokens
+            boundary = (
+                (request.num_prompt_tokens - 1) // cache.block_size * cache.block_size
+            )
+            if not start < boundary <= start + count:
+                continue
+            pages = boundary // cache.block_size
+            block_ids = self.get_blocks(request_id).get_block_ids()
+            descriptor = cache.reserve_capture(
+                boundary,
+                request.block_hashes[pages - 1],
+                tuple(tuple(group[:pages]) for group in block_ids),
+            )
+            if descriptor is not None:
+                operations.captures[request_id] = descriptor
+        return operations if operations.captures or operations.restores else None
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """Calculate the number of common prefix blocks for each kv cache group.

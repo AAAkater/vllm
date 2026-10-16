@@ -31,6 +31,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.auxiliary_prefix_cache import (
+    AuxiliaryPrefixCache,
+    supports_auxiliary_prefix_speculation,
+)
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -292,6 +296,35 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        auxiliary_prefix_cache = None
+        if self.cache_config.enable_prefix_caching and any(
+            group.kv_cache_spec.requires_auxiliary_prefix_state
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            if (
+                len(kv_cache_config.kv_cache_groups) != 1
+                or hash_block_size != block_size
+                or self.dcp_world_size != 1
+                or self.connector is not None
+                or not supports_auxiliary_prefix_speculation(
+                    vllm_config.speculative_config.method
+                    if vllm_config.speculative_config is not None else None,
+                    self.max_num_running_reqs,
+                )
+            ):
+                raise ValueError(
+                    "Auxiliary prefix checkpoints require one uniform local page group "
+                    "without context parallelism; speculative state is supported "
+                    "only for one owned DSpark request"
+                )
+            auxiliary_prefix_cache = AuxiliaryPrefixCache(
+                capacity=min(128, 2 * self.max_num_running_reqs),
+                world_size=(
+                    self.parallel_config.tensor_parallel_size
+                    * self.parallel_config.pipeline_parallel_size
+                ),
+                block_size=block_size,
+            )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -307,6 +340,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            auxiliary_prefix_cache=auxiliary_prefix_cache,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1363,6 +1397,11 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            auxiliary_prefix_operations=self.kv_cache_manager.prepare_auxiliary_prefixes(
+                [req.request_id for req in scheduled_new_reqs + scheduled_resumed_reqs],
+                self.requests,
+                num_scheduled_tokens,
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1813,6 +1852,15 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        auxiliary = scheduler_output.auxiliary_prefix_operations
+        if auxiliary is not None:
+            cache = self.kv_cache_manager.auxiliary_prefix_cache
+            assert cache is not None
+            cache.complete(
+                auxiliary, model_runner_output.auxiliary_prefix_acknowledgments or []
+            )
+        elif model_runner_output.auxiliary_prefix_acknowledgments:
+            raise RuntimeError("Unexpected auxiliary prefix acknowledgment")
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

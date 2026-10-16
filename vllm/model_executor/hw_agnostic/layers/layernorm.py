@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 import torch.nn as nn
-from torch import Tensor
+import torch.nn.functional as F
 
 from vllm.model_executor.hw_agnostic.custom_op import CustomOp
 
@@ -34,57 +34,43 @@ class RMSNorm(CustomOp):
         else:
             self.register_buffer("weight", weight, persistent=False)
 
-    def _rms_norm(
-        self,
-        x: Tensor,
-        weight: Tensor | None,
-        epsilon: float,
-        variance_size: int | None = None,
-    ) -> Tensor:
-        """Weighted root-mean-square layer normalization"""
+    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
-        x = x.to(torch.float32)
-        x_var = x if variance_size is None else x[..., :variance_size]
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + epsilon)
-        if weight is not None:
-            x = x.to(weight.dtype) * weight
-        return x.to(orig_dtype)
-
-    def _fused_add_rms_norm(
-        self,
-        x: Tensor,
-        x_residual: Tensor,
-        weight: Tensor | None,
-        epsilon: float,
-        variance_size: int | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Fused add and weighted root-mean-square layer normalization"""
-        orig_dtype = x.dtype
-        x = x.to(torch.float32)
-        x = x + x_residual.to(torch.float32)
-        x_residual = x.to(orig_dtype)
-
-        x_var = x if variance_size is None else x[..., :variance_size]
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + epsilon)
-        if weight is not None:
-            x = x.to(weight.dtype) * weight
-        return x.to(orig_dtype), x_residual
+        x_fp32 = x.to(torch.float32)
+        if self.variance_size_override is None:
+            variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        else:
+            head = x_fp32[..., : self.variance_size_override]
+            variance = head.pow(2).mean(dim=-1, keepdim=True)
+        x_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+        out = x_fp32.to(orig_dtype)
+        if self.has_weight:
+            out = out * self.weight
+        return out
 
     def forward_native(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        weight = self.weight if self.has_weight else None
-        epsilon = self.variance_epsilon
-        variance_size = self.variance_size_override
-
         if residual is None:
-            return self._rms_norm(x, weight, epsilon, variance_size)
-        else:
-            return self._fused_add_rms_norm(x, residual, weight, epsilon, variance_size)
+            return self._rms_norm(x)
+        residual = residual + x.to(residual.dtype)
+        return self._rms_norm(residual), residual
 
     def extra_repr(self) -> str:
         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(
+            x.float(), (self.dim,), self.weight, self.bias, self.eps
+        ).type_as(x)

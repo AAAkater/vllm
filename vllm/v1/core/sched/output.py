@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixOperations
 
 if TYPE_CHECKING:
     import numpy as np
@@ -294,6 +295,8 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    auxiliary_prefix_operations: AuxiliaryPrefixOperations | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

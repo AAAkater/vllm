@@ -132,6 +132,21 @@ class DeviceCapability(NamedTuple):
 
 
 class Platform:
+    @classmethod
+    def supports_v1_speculative_method(cls, method: str, vllm_config) -> bool:
+        """Whether an out-of-tree V1 runner implements a V2-only method."""
+        return False
+
+    @classmethod
+    def get_max_concurrent_batches(cls, vllm_config) -> int | None:
+        """Override in-flight batch capacity for a platform-owned runner."""
+        return None
+
+    @classmethod
+    def supports_v2_without_triton(cls, vllm_config) -> bool:
+        """Whether this configuration uses a native non-Triton V2 adapter."""
+        return False
+
     _enum: PlatformEnum
     device_name: str
     device_type: str

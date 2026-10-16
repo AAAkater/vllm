@@ -162,6 +162,11 @@ class KVCacheSpec:
         return True
 
     @property
+    def requires_auxiliary_prefix_state(self) -> bool:
+        """Whether a token-page hit also needs an all-worker state checkpoint."""
+        return False
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -1046,6 +1051,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def prefix_cacheable(self) -> bool:
         return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
+    def requires_auxiliary_prefix_state(self) -> bool:
+        return any(
+            spec.requires_auxiliary_prefix_state for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def first_spec(self) -> KVCacheSpec:

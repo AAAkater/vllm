@@ -123,7 +123,13 @@ class CpuGpuBuffer:
             self.cpu = torch.zeros(
                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
             )
-            self.gpu = torch.zeros_like(self.cpu, device=device)
+            target_device = torch.device(device)
+            if target_device.type == "hpu":
+                # The CPU mirror already contains the required zero values.
+                # Copy it instead of compiling a separate HPU zero-fill graph.
+                self.gpu = self.cpu.to(device=target_device, non_blocking=True)
+            else:
+                self.gpu = torch.zeros_like(self.cpu, device=target_device)
         self.np: np.ndarray
         # To keep type hints simple (avoiding generics and subclasses), we
         # only conditionally create the numpy array attribute. This can cause

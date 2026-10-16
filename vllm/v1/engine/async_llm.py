@@ -190,6 +190,7 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
+        self.profiler = None
         if (
             vllm_config.profiler_config.profiler == "torch"
             and not vllm_config.profiler_config.ignore_frontend
@@ -271,12 +272,12 @@ class AsyncLLM(EngineClient):
         if renderer := getattr(self, "renderer", None):
             renderer.shutdown()
 
-        if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown(timeout=timeout)
-
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        if engine_core := getattr(self, "engine_core", None):
+            engine_core.shutdown(timeout=timeout)
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()

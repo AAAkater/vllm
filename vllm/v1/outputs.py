@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixAck
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -368,6 +369,12 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    # Optional host-only correlation keys (request, generation, target count).
+    # The worker retains timestamps; EngineCore records final consumption.
+    execution_rounds: list[tuple[str, int, int]] | None = None
+
+    auxiliary_prefix_acknowledgments: list[AuxiliaryPrefixAck] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

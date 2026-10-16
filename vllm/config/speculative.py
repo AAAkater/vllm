@@ -1526,9 +1526,16 @@ class SpeculativeConfig:
                     )
                 )
 
+                from vllm.platforms import current_platform
+
+                last_stage_draft = self.use_dspark_last_stage_drafter() and (
+                    current_platform.supports_v1_speculative_method("dspark", self)
+                )
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        pipeline_parallel_size=1 if last_stage_draft else None,
                     )
                 )
 
@@ -1718,13 +1725,19 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        *,
+        pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if pipeline_parallel_size is None
+                else pipeline_parallel_size
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -1734,6 +1747,14 @@ class SpeculativeConfig:
         )
 
         return draft_parallel_config
+
+    def use_dspark_last_stage_drafter(self) -> bool:
+        # vLLM #53577: the draft runs wholly on the target's final PP stage.
+        return (
+            self.method == "dspark"
+            and self.target_parallel_config is not None
+            and self.target_parallel_config.pipeline_parallel_size > 1
+        )
 
     @field_validator("attention_backend", mode="before")
     @classmethod

@@ -575,6 +575,13 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        from vllm.platforms import current_platform
+
+        capacity = current_platform.get_max_concurrent_batches(self)
+        if capacity is not None:
+            if capacity < 1:
+                raise ValueError("Platform batch capacity must be positive")
+            return capacity
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -2656,9 +2663,13 @@ class VllmConfig:
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallel")
 
-        # DSpark is implemented only by the V2 GPU model runner.
+        # Device plugins can provide their own maintained V1 speculator.
         if self.speculative_config:
-            if self.speculative_config.method == "dspark":
+            from vllm.platforms import current_platform
+
+            if self.speculative_config.method == "dspark" and not (
+                current_platform.supports_v1_speculative_method("dspark", self)
+            ):
                 unsupported.append("dspark speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
@@ -2768,7 +2779,9 @@ class VllmConfig:
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""
-        if not HAS_TRITON:
+        from vllm.platforms import current_platform
+
+        if not HAS_TRITON and not current_platform.supports_v2_without_triton(self):
             raise ValueError("Model Runner V2 requires Triton.")
 
         unsupported = self._get_v2_model_runner_unsupported_features()
