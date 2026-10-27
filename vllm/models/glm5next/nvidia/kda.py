@@ -43,11 +43,26 @@ if current_platform.is_rocm():
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
-else:
+elif current_platform.is_cuda():
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
+else:
+    NATIVE_KDA_KERNELS_AVAILABLE = False
+
+    def _native_kda_kernels_unavailable(*args, **kwargs):
+        raise RuntimeError(
+            "GLM-5.3 native KDA kernels require CUDA or ROCm. On HPU, "
+            "vllm-gaudi must replace Glm5NextLinearAttention with its "
+            "torch-native KDA implementation before forward is called."
+        )
+
+    chunk_kda_with_fused_gate = _native_kda_kernels_unavailable
+    fused_recurrent_kda = _native_kda_kernels_unavailable
+
+if current_platform.is_cuda() or current_platform.is_rocm():
+    NATIVE_KDA_KERNELS_AVAILABLE = True
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):

@@ -12,6 +12,8 @@ class Glm5NextTextConfig(PretrainedConfig):
     model_type = "glm5_next_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+    _MODEL_LAYER_TYPES = ("linear_attention", "deepseek_sparse_attention")
+    _MLP_LAYER_TYPES = ("dense", "sparse")
 
     def __init__(
         self,
@@ -181,7 +183,6 @@ class Glm5NextTextConfig(PretrainedConfig):
         # Per-layer attention / MLP layout. Normalize mlp_layer_types from
         # first_k_dense_replace when the new-schema field is absent so layer
         # construction sees a consistent layout (mirrors cohere2_moe).
-        self.layer_types = layer_types
         if mlp_layer_types is None:
             n = self.num_hidden_layers
             if first_k_dense_replace is not None:
@@ -228,6 +229,48 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        # PretrainedConfig's strict decorator captures its own validators when
+        # the base class is defined, so a subclass override is not called by
+        # super().__init__(). Assign layer_types afterwards and run this model's
+        # validator explicitly to avoid changing Transformers' global allowlist.
+        self.layer_types = layer_types
+        self.validate()
+
+    def validate(self) -> None:
+        """Run strict validators with the GLM-5.3 layer-type schema."""
+        for validator in getattr(PretrainedConfig, "__class_validators__"):
+            if validator.__name__ == "validate_layer_type":
+                self.validate_layer_type()
+            else:
+                validator(self)
+
+    def validate_layer_type(self) -> None:
+        """Validate model and MLP layer layouts without global allowlisting."""
+        self._validate_layer_types("layer_types", self._MODEL_LAYER_TYPES)
+        self._validate_layer_types("mlp_layer_types", self._MLP_LAYER_TYPES)
+
+    def _validate_layer_types(
+        self, field_name: str, allowed_layer_types: tuple[str, ...]
+    ) -> None:
+        layers = getattr(self, field_name, None)
+        if layers is None:
+            return
+
+        unsupported = [layer for layer in layers if layer not in allowed_layer_types]
+        if unsupported:
+            raise ValueError(
+                f"Unsupported {field_name} entries for GLM-5.3: {unsupported}; "
+                f"expected values from {allowed_layer_types}"
+            )
+        if (
+            self.num_hidden_layers is not None
+            and len(layers) != self.num_hidden_layers
+        ):
+            raise ValueError(
+                f"`num_hidden_layers` ({self.num_hidden_layers}) must be equal "
+                f"to the number of `{field_name}` ({len(layers)})"
+            )
 
     @property
     def is_mla(self):

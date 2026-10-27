@@ -93,6 +93,17 @@ def fused_q_kv_rmsnorm(
     if num_tokens == 0:
         return qr_out, kv_out
 
+    if not current_platform.is_cuda_alike():
+
+        def _rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            x_fp32 = x.float()
+            scale = torch.rsqrt(
+                x_fp32.square().mean(dim=-1, keepdim=True) + eps
+            )
+            return (x_fp32 * scale * weight.float()).to(x.dtype)
+
+        return _rmsnorm(qr, q_weight), _rmsnorm(kv, kv_weight)
+
     block_size = triton.next_power_of_2(max(q_size, kv_size))
     _fused_q_kv_rmsnorm_kernel[(num_tokens, 2)](
         qr,

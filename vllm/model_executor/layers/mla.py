@@ -192,7 +192,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_proj_layer = self.q_proj
             q_proj_input = hidden_states
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if self.qk_rope_head_dim == 0:
+            kv_c = kv_lora
+            k_pe = kv_lora.new_empty((*kv_lora.shape[:-1], 0))
+        else:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
         if self.fuse_qkv_rmsnorm and q_c is not None:
             # Fuse q_a + kv_a RMSNorm into one kernel launch (q_c is still the
             # pre-norm projection output here).
@@ -207,7 +213,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_c = q_proj_input
         else:
             kv_c_normed = self.kv_a_layernorm(kv_c)
-        # Add head dim of 1 to k_pe
+        # Add a singleton head dimension; k_pe is empty for NoPE MLA.
         k_pe = k_pe.unsqueeze(1)
 
         q = q_proj_layer(q_proj_input)[0]

@@ -38,6 +38,15 @@ from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
 
+
+def _is_hpu_device() -> bool:
+    return getattr(current_platform, "device_type", None) == "hpu"
+
+
+def _skip_rotary_embedding(qk_rope_head_dim: int, skip_rope: bool | None) -> bool:
+    return bool(skip_rope) or qk_rope_head_dim == 0
+
+
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
 # fusion of the surrounding eager ops; carving each cluster into its own
@@ -492,6 +501,7 @@ class Glm5NextMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        skip_rope = _skip_rotary_embedding(qk_rope_head_dim, skip_rope)
         if not skip_rope:
             assert config.rope_parameters is not None
             if config.rope_parameters["rope_type"] != "default":
@@ -520,14 +530,23 @@ class Glm5NextMLAAttention(nn.Module):
             self.rotary_emb = None
 
         self.is_v32 = config.index_topk is not None
+        if _is_hpu_device():
+            self.is_v32 = False
+            logger.warning_once(
+                "GLM-5.3 HPU: using dense NoPE MLA; sparse k-pool indexer "
+                "is disabled."
+            )
 
         if self.is_v32:
-            self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not config.indexer_rope_interleave,
-            )
+            if qk_rope_head_dim > 0 and config.rope_parameters is not None:
+                self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not config.indexer_rope_interleave,
+                )
+            else:
+                self.indexer_rope_emb = None
             # The sparse indexer projects from the MLA q-lora rank, which is
             # always set for v32 MLA configs; narrow away the `int | None`.
             assert q_lora_rank is not None

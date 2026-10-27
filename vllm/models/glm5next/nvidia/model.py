@@ -68,6 +68,8 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -93,6 +95,112 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+_GLM53_HPU_DENSE_MAX_MODEL_LEN = 2048
+
+_GLM5NEXT_HF_TO_VLLM_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+        "model.visual.": "visual.",
+        "model.": "language_model.model.",
+    }
+)
+
+
+def _validate_glm53_hpu_runtime(
+    vllm_config: VllmConfig, device_type: str | None = None
+) -> None:
+    if device_type is None:
+        device_type = current_platform.device_type
+    if device_type != "hpu":
+        return
+
+    model_config = vllm_config.model_config
+    if (
+        getattr(model_config.hf_config, "index_topk", None) is not None
+        and model_config.max_model_len > _GLM53_HPU_DENSE_MAX_MODEL_LEN
+    ):
+        raise ValueError(
+            "GLM-5.3 HPU dense MLA is a diagnostic fallback limited to "
+            f"max_model_len <= {_GLM53_HPU_DENSE_MAX_MODEL_LEN}; got "
+            f"{model_config.max_model_len}. Sparse k-pool equivalence has "
+            "not been validated."
+        )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "GLM-5.3 HPU requires --no-enable-prefix-caching; prefix caching "
+            "can corrupt KDA recurrent state."
+        )
+    if vllm_config.speculative_config is not None:
+        raise ValueError(
+            "GLM-5.3 HPU does not support speculative decoding or MTP."
+        )
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        raise ValueError("GLM-5.3 HPU requires pipeline_parallel_size=1.")
+
+
+def _weights_mapper_for_mode(language_model_only: bool) -> WeightsMapper:
+    mapper = _GLM5NEXT_HF_TO_VLLM_MAPPER
+    if language_model_only:
+        mapper = mapper | WeightsMapper(orig_to_new_prefix={"visual.": None})
+    return mapper
+
+
+def _is_unmodeled_dense_indexer_weight(
+    name: str,
+    params_dict: dict[str, nn.Parameter],
+    *,
+    is_hpu: bool,
+    sparse_enabled: bool,
+) -> bool:
+    if not is_hpu or sparse_enabled or ".indexer." not in name:
+        return False
+    layer_prefix = name.split(".indexer.", 1)[0]
+    indexer_prefix = f"{layer_prefix}.indexer."
+    return not any(param_name.startswith(indexer_prefix) for param_name in params_dict)
+
+
+def _get_checkpoint_param(
+    name: str, params_dict: dict[str, nn.Parameter]
+) -> nn.Parameter:
+    param = params_dict.get(name)
+    if param is None:
+        raise ValueError(
+            f"Checkpoint weight {name!r} has no matching model parameter. "
+            "GLM-5.3 weight loading only skips disabled MTP weights, "
+            "HPU-dense indexer weights, and language-model-only visual weights."
+        )
+    return param
+
+
+def _require_cpu_fp8_source(
+    tensor: torch.Tensor,
+    name: str,
+    target_device_type: str | None = None,
+) -> None:
+    if target_device_type is None:
+        target_device_type = current_platform.device_type
+    if (
+        target_device_type == "hpu"
+        and tensor.dtype == torch.float8_e4m3fn
+        and tensor.device.type != "cpu"
+    ):
+        raise RuntimeError(
+            f"GLM-5.3 FP8 weight {name!r} reached the loader on "
+            f"{tensor.device}. Serialized e4m3fn bytes must be dequantized "
+            "on CPU before any device transfer."
+        )
+
+
+def _flatten_bucket_inputs(
+    hidden_states: torch.Tensor, positions: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hidden_states.dim() > 2:
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if positions.dim() > 1:
+        positions = positions.reshape(-1)
+    return hidden_states, positions
 
 
 class Glm5NextMLP(nn.Module):
@@ -578,6 +686,7 @@ class Glm5NextDecoderLayer(nn.Module):
 class Glm5NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        _validate_glm53_hpu_runtime(vllm_config)
 
         config = vllm_config.model_config.hf_config
         self.config = config
@@ -585,7 +694,13 @@ class Glm5NextModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
 
-        self.is_v32 = config.index_topk is not None
+        self.is_hpu = self.device == "hpu"
+        self.is_v32 = config.index_topk is not None and not self.is_hpu
+        if self.is_hpu and config.index_topk is not None:
+            logger.warning_once(
+                "GLM-5.3 HPU: sparse k-pool indexer is disabled; "
+                "MLA layers use the dense NoPE fallback."
+            )
         if self.is_v32:
             topk_tokens = config.index_topk
             assert topk_tokens is not None
@@ -678,6 +793,7 @@ class Glm5NextModel(nn.Module):
             post = None
             comb = None
 
+        hidden_states, positions = _flatten_bucket_inputs(hidden_states, positions)
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
@@ -736,6 +852,7 @@ class Glm5NextModel(nn.Module):
             expert_params_mapping = []
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        skipped_dense_indexer_weights: list[str] = []
 
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
@@ -753,10 +870,21 @@ class Glm5NextModel(nn.Module):
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
-                continue  # skip spec decode layers for main model
+                # MTP is served by its draft model; the target model never owns
+                # these parameters.
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+
+            if _is_unmodeled_dense_indexer_weight(
+                name,
+                params_dict,
+                is_hpu=self.is_hpu,
+                sparse_enabled=self.is_v32,
+            ):
+                skipped_dense_indexer_weights.append(name)
                 continue
 
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
@@ -804,16 +932,13 @@ class Glm5NextModel(nn.Module):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
-                    continue
                 name = name_mapped
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
-                param = params_dict[name]
+                param = _get_checkpoint_param(name, params_dict)
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -829,7 +954,7 @@ class Glm5NextModel(nn.Module):
                     name = name.replace(weight_name, param_name)
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    param = _get_checkpoint_param(name, params_dict)
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -855,12 +980,17 @@ class Glm5NextModel(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
 
-                    param = params_dict[name]
+                    param = _get_checkpoint_param(name, params_dict)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if skipped_dense_indexer_weights:
+            logger.info(
+                "GLM-5.3 HPU dense MLA skipped %d checkpoint indexer weights",
+                len(skipped_dense_indexer_weights),
+            )
         return loaded_params
 
 
@@ -952,7 +1082,9 @@ class Glm5NextForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self._glm53_loaded_params = loaded
+        return loaded
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -970,12 +1102,7 @@ class Glm5NextForConditionalGeneration(
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
 
-    # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
-    # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
-    # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``),
-    # matching the GLM-OCR / GLM-4V serialization convention. If the real
-    # checkpoint's safetensors keys differ (e.g. ``language_model.model.`` with
-    # no outer ``model.``), override ``hf_to_vllm_mapper`` accordingly.
+    hf_to_vllm_mapper = _GLM5NEXT_HF_TO_VLLM_MAPPER
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
@@ -996,6 +1123,7 @@ class Glm5NextForConditionalGeneration(
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        _validate_glm53_hpu_runtime(vllm_config)
         super(Glm4vForConditionalGeneration, self).__init__()
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1004,29 +1132,30 @@ class Glm5NextForConditionalGeneration(
         self.config = config
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        self.is_multimodal_pruning_enabled = (
-            multimodal_config.is_multimodal_pruning_enabled()
+        self.language_model_only = bool(
+            getattr(multimodal_config, "language_model_only", False)
         )
-
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Glm5NextVisionTransformer(
-                config.text_config,
-                config.vision_config,
-                # Read eps from the VISION sub-config, not the top-level
-                # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
-                # the latter onto text_config (1e-5), silently ignoring the
-                # vision tower's own (1e-6) rms_norm_eps.
-                norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "visual"),
+        if self.language_model_only:
+            self.use_data_parallel = False
+            self.is_multimodal_pruning_enabled = False
+            self.visual = StageMissingLayer("vision_tower")
+            self._tower_model_names = []
+        else:
+            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+            self.is_multimodal_pruning_enabled = (
+                multimodal_config.is_multimodal_pruning_enabled()
             )
+
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Glm5NextVisionTransformer(
+                    config.text_config,
+                    config.vision_config,
+                    # Use the vision sub-config's RMSNorm epsilon.
+                    norm_eps=config.vision_config.rms_norm_eps,
+                    # The vision tower is BF16 in this checkpoint.
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -1047,6 +1176,13 @@ class Glm5NextForConditionalGeneration(
         config.buffer_keys = [k for k in config.buffer_keys if k != "pos_embeds"]
         return config
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapper = _weights_mapper_for_mode(self.language_model_only)
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        self._glm53_loaded_params = loaded
+        return loaded
+
 
 def get_spec_layer_idx_from_weight_name(
     config: Glm5NextConfig, weight_name: str
@@ -1066,6 +1202,7 @@ def get_spec_layer_idx_from_weight_name(
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
+    _require_cpu_fp8_source(tensor, name)
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
     is_scale = "weight_scale_inv" in name
     if not is_weight and not is_scale:
@@ -1087,7 +1224,7 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     )
 
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
-    param = params_dict[fused_name]
+    param = _get_checkpoint_param(fused_name, params_dict)
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
     return True
@@ -1105,6 +1242,7 @@ def _dequant_fp8_block(
     scale broadcast and trimming back afterwards (e.g. kv_a_proj_with_mqa is
     576 rows = 4*128 + 64).
     """
+    _require_cpu_fp8_source(weight_fp8, "dequant_fp8_block")
     out_dim, in_dim = weight_fp8.shape
     pad_out = (-out_dim) % block_size
     pad_in = (-in_dim) % block_size
@@ -1187,7 +1325,7 @@ def _try_load_fp8_attn_proj(
         )
         weight_bf16 = torch.cat([weight_bf16, pad], dim=0)
 
-    param = params_dict[target_w]
+    param = _get_checkpoint_param(target_w, params_dict)
     if shard_id is None:
         param.weight_loader(param, weight_bf16)
     else:
